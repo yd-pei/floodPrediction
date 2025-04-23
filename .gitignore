@@ -1,8 +1,9 @@
 /.DS_Store
 /.idea
-/checkpoint
-/data
+/data/Precipitation
 /floodPrediction.ipynb
-/lossPic
 /model
 /oldLossPic
+/tool
+/newdata
+/data/precip.pt

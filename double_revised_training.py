@@ -13,7 +13,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from IPython.display import clear_output
 
-# ===================== 超参数 & 路径 =====================
+# ===================== SuperParameter =====================
 data_dir = "./data/"
 model_dir = "./model/"
 picPath = "./lossPic/"
@@ -28,6 +28,7 @@ LR          = 1e-3
 EPOCHS      = 20
 STATION_ID  = 2301738
 
+READING_THREAD = 8 if os.name == 'nt' else 4
 # ===================== 数据加载函数 =====================
 
 def load_precipitation_sequence(start_time: datetime, t_steps: int, precip_dir: str):
@@ -150,7 +151,7 @@ def verify():
     dataloader  = DataLoader(dataset,
                              batch_size=BATCH_SIZE,
                              shuffle=True,
-                             num_workers=4,
+                             num_workers=READING_THREAD,
                              pin_memory=(device.type == "cuda"),
                              persistent_workers=True)
     model       = FloodPredictor().to(device)
@@ -209,6 +210,7 @@ def verify():
 # ===================== 主训练流程 =====================
 
 def main():
+    print(READING_THREAD)
     device = torch.device("cpu")
     if torch.backends.mps.is_available():
         device = torch.device("mps")
