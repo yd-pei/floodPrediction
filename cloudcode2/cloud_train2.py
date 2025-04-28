@@ -19,21 +19,19 @@ data_dir    = "./data/"
 model_dir   = "./checkpoint/"
 picPath     = "./lossPic/"
 checkpoint_dir = "./checkpoint/"
-validation_dir = "./validation_result/"
 PRECIP_DIR  = os.path.join(data_dir, "Precipitation")
 PRECIP_PT   = os.path.join(data_dir, "precip.pt")
 DEM_PATH    = os.path.join(data_dir, "dem_resampled.tif")
 GAGE_CSV    = os.path.join(data_dir, "gageheight_ffill.csv")
 RUNOFF_CSV  = os.path.join(data_dir, "runoff_hourly.csv")
-VALID_CKP   = os.path.join(checkpoint_dir, "tw12_24h_epoch200_1e_4.pth")
+VALID_CKP   = os.path.join(checkpoint_dir, "lstm36min_epoch200_1e_3.pth")
 
 T_STEPS     = 24      # 滑窗长度
 BATCH_SIZE  = 32
 LR_POWER = -4
 LR          = 1*(10 ** LR_POWER)
-EPOCHS      = 2
+EPOCHS      = 200
 STATION_ID  = 2301738
-PREDICT_WINDOW = 12
 
 READING_THREAD = 0
 
@@ -126,7 +124,7 @@ class FloodDataset(Dataset):
         target_time   = start_time + timedelta(hours=self.t_steps)
         prev_date     = (target_time.date() - timedelta(days=1))
         gage_scalar   = torch.tensor(self.gage_df.at[pd.to_datetime(prev_date), str(self.station_id)]).float().to(self.precip_all.device)
-        future_idx = pd.date_range(start=target_time, periods=PREDICT_WINDOW, freq="h")
+        future_idx = pd.date_range(start=target_time, periods=24, freq="h")
         vals = self.runoff_df.loc[
             future_idx, str(self.station_id)
         ].astype(float).values
@@ -273,7 +271,7 @@ def verify_non_overlapping_windows_to_csv():
 
     # 5. 保存到 CSV
     df       = pd.DataFrame(records)
-    csv_path = os.path.join(validation_dir, "predictions_non_overlap.csv")
+    csv_path = os.path.join(checkpoint_dir, "predictions_non_overlap.csv")
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     print(f"\n已将所有窗口的预测结果保存到: {csv_path}")
 
@@ -282,7 +280,7 @@ def verify_non_overlapping_windows_to_csv():
 def main():
     # 1. 选设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"Using device: {device}",flush=True)
 
     # 2. 预加载全部光栅到 GPU
     precip_all, dem = direct_preload(device)
@@ -344,8 +342,8 @@ def main():
     for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
         total_loss = 0.0
-        pbar = tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}", unit="batch")
-        for spatial, gage, prev_runoff, runoff in pbar:
+        # pbar = tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}", unit="batch")
+        for spatial, gage, prev_runoff, runoff in loader:
             # data 已经在 GPU 上
             # forward
             pred = model(spatial, gage, prev_runoff)
@@ -357,10 +355,10 @@ def main():
             optimizer.step()
 
             total_loss += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            # pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         avg_loss = total_loss / len(loader)
-        print(f"Epoch {epoch}: Avg Loss={avg_loss:.4f}")
+        print(f"Epoch {epoch}: Avg Loss={avg_loss:.4f}",flush=True)
 
         # 调度
         scheduler.step(avg_loss)
@@ -389,5 +387,5 @@ def main():
  
 
 if __name__ == "__main__":
-    # main()
-    verify_non_overlapping_windows_to_csv()
+    main()
+    # verify_non_overlapping_windows_to_csv()
