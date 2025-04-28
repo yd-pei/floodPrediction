@@ -28,9 +28,9 @@ VALID_CKP   = os.path.join(checkpoint_dir, "lstm36min_epoch200_1e_3.pth")
 
 T_STEPS     = 36      # 滑窗长度
 BATCH_SIZE  = 32
-LR_POWER = -3
+LR_POWER = -4
 LR          = 1*(10 ** LR_POWER)
-EPOCHS      = 200
+EPOCHS      = 2
 STATION_ID  = 2301738
 
 READING_THREAD = 0
@@ -124,9 +124,24 @@ class FloodDataset(Dataset):
         target_time   = start_time + timedelta(hours=self.t_steps)
         prev_date     = (target_time.date() - timedelta(days=1))
         gage_scalar   = torch.tensor(self.gage_df.at[pd.to_datetime(prev_date), str(self.station_id)]).float().to(self.precip_all.device)
-        runoff_scalar = torch.tensor(self.runoff_df.at[target_time, str(self.station_id)]).float().to(self.precip_all.device)
+        future_idx = pd.date_range(start=target_time, periods=24, freq="h")
+        vals = self.runoff_df.loc[
+            future_idx, str(self.station_id)
+        ].astype(float).values
+        avg_runoff = torch.tensor(vals.mean()).float().to(self.precip_all.device)
+        prev_time   = target_time - timedelta(hours=1)
+        # 新增：前一时刻 runoff
+        try:
+            prev_runoff_scalar = torch.tensor(
+                self.runoff_df.at[prev_time, str(self.station_id)]
+            ).float().to(self.precip_all.device)
+        except KeyError:
+            # 如果缺失，可以填 0 或者其它策略
+            print(f"Warning: Missing runoff data for {prev_time}. Filling with 0.")
+            prev_runoff_scalar = torch.tensor(0.0).float().to(self.precip_all.device)
 
-        return spatial, gage_scalar, runoff_scalar
+
+        return spatial, gage_scalar,prev_runoff_scalar , avg_runoff
 
 # ===================== 模型定义 =====================
 
@@ -163,21 +178,29 @@ class ConvLSTM(nn.Module):
         return h
 
 
+# ================ 修改 FloodPredictor =================
 class FloodPredictor(nn.Module):
     def __init__(self, input_dim=2, hidden_dim=16, kernel_size=3):
         super().__init__()
         self.convlstm = ConvLSTM(input_dim, hidden_dim, kernel_size)
         self.pool     = nn.AdaptiveAvgPool2d((1, 1))
+        # 这里把输入维度从 hidden_dim+1 → hidden_dim+2
         self.fc       = nn.Sequential(
-            nn.Linear(hidden_dim + 1, 64),
+            nn.Linear(hidden_dim + 2, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, 1)
         )
 
-    def forward(self, spatial, gage_scalar):
-        h       = self.convlstm(spatial)
-        h_pool  = self.pool(h).flatten(1)
-        x       = torch.cat([h_pool, gage_scalar.view(-1, 1)], dim=1)
+    def forward(self, spatial, gage_scalar, prev_runoff):
+        # convLSTM + 池化
+        h      = self.convlstm(spatial)
+        h_pool = self.pool(h).flatten(1)        # (B, hidden_dim)
+        # 拼接 gage 和前一时刻 runoff
+        x = torch.cat([
+            h_pool,
+            gage_scalar.view(-1, 1),
+            prev_runoff.view(-1, 1)
+        ], dim=1)                              # (B, hidden_dim+2)
         return self.fc(x).squeeze(1)
 
 def verify_non_overlapping_windows_to_csv():
@@ -195,9 +218,9 @@ def verify_non_overlapping_windows_to_csv():
     model.eval()
 
     # 3. 定义验证窗口
-    val_start = datetime(2020, 1, 1, 0, 0)
-    val_end   = datetime(2021, 1, 1, 0, 0)
-    window_delta = timedelta(hours=T_STEPS)
+    val_start     = datetime(2020, 1, 1, 0, 0)
+    val_end       = datetime(2021, 1, 1, 0, 0)
+    window_delta  = timedelta(hours=T_STEPS)
     total_windows = (val_end - val_start) // window_delta
 
     # 4. 循环验证，收集结果
@@ -206,7 +229,7 @@ def verify_non_overlapping_windows_to_csv():
         start_time = val_start + i * window_delta
         end_time   = start_time + window_delta
 
-        ds = FloodDataset(
+        ds     = FloodDataset(
             start_times=[start_time],
             precip_all=precip_all,
             dem=dem,
@@ -219,35 +242,39 @@ def verify_non_overlapping_windows_to_csv():
         loader = DataLoader(ds, batch_size=1, shuffle=False)
 
         with torch.no_grad():
-            for spatial, gage, true_runoff in loader:
-                spatial     = spatial.to(device)
-                gage        = gage.to(device)
-                true_runoff = true_runoff.to(device)
+            # 解包时多一个 prev_runoff
+            for spatial, gage, prev_runoff, true_runoff in loader:
+                spatial      = spatial.to(device)
+                gage         = gage.to(device)
+                prev_runoff  = prev_runoff.to(device)
+                true_runoff  = true_runoff.to(device)
 
-                pred = model(spatial, gage)
+                # 把 prev_runoff 也传进去
+                pred = model(spatial, gage, prev_runoff)
 
                 pred_val = pred.item()
                 true_val = true_runoff.item()
-                err = pred - true_runoff
-                mse = float((err ** 2).item())
-                mae = float(err.abs().item())
+                err      = pred - true_runoff
+                mse      = float((err ** 2).item())
+                mae      = float(err.abs().item())
 
         records.append({
-            "window_idx":     i + 1,
-            "start_time":     start_time.isoformat(),
-            "end_time":       end_time.isoformat(),
-            "predicted":      pred_val,
-            "ground_truth":   true_val,
-            "mse":            mse,
-            "mae":            mae
+            "window_idx":   i + 1,
+            "start_time":   start_time.isoformat(),
+            "end_time":     end_time.isoformat(),
+            "predicted":    pred_val,
+            "ground_truth": true_val,
+            "mse":          mse,
+            "mae":          mae
         })
         print(f"[窗口 {i+1}] {start_time} → {end_time}  MSE={mse:.4f}  MAE={mae:.4f}")
 
     # 5. 保存到 CSV
-    df = pd.DataFrame(records)
+    df       = pd.DataFrame(records)
     csv_path = os.path.join(checkpoint_dir, "predictions_non_overlap.csv")
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     print(f"\n已将所有窗口的预测结果保存到: {csv_path}")
+
 
 # ================ 主流程 ================================
 def main():
@@ -256,52 +283,73 @@ def main():
     print(f"Using device: {device}")
 
     # 2. 预加载全部光栅到 GPU
-    # precip_all, dem = parallel_preload_data(device)
     precip_all, dem = direct_preload(device)
 
     # 3. 构造时间列表
     base_time   = datetime(2021, 1, 1, 0)
-    end         = datetime(2024, 1, 1, 0)
+    end         = datetime(2024, 12, 30, 23)
     total_hours = int((end - base_time).total_seconds() // 3600)
     start_times = [base_time + timedelta(hours=i) for i in range(total_hours - T_STEPS + 1)]
 
     # 4. Dataset & DataLoader
-    dataset  = FloodDataset(start_times, precip_all, dem, GAGE_CSV, RUNOFF_CSV, STATION_ID, base_time, T_STEPS)
-    loader   = DataLoader(dataset,
-                          batch_size=BATCH_SIZE,
-                          shuffle=True,
-                          num_workers=READING_THREAD,
-                          pin_memory=False,
-                          persistent_workers=False
+    dataset = FloodDataset(
+        start_times,
+        precip_all,
+        dem,
+        GAGE_CSV,
+        RUNOFF_CSV,
+        STATION_ID,
+        base_time,
+        T_STEPS
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=READING_THREAD,
+        pin_memory=False,
+        persistent_workers=False
     )
 
-    # 5. 模型、优化器、训练循环照旧
+    # 5. 模型、优化器、损失、调度
     model     = FloodPredictor().to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=LR)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5
+    )
 
-    # …（加载 checkpoint 逻辑保持不变）…
+    # 6. （可选）加载 checkpoint
     pattern = re.compile(r"FloodPredictor_epoch(\d+)\.pth")
-    start_epoch = 1
     checkpoints = []
     for fname in os.listdir(checkpoint_dir):
         match = pattern.match(fname)
         if match:
             epoch = int(match.group(1))
             checkpoints.append((epoch, fname))
+    if checkpoints:
+        latest_epoch, latest_file = max(checkpoints, key=lambda x: x[0])
+        ckpt = torch.load(os.path.join(checkpoint_dir, latest_file), map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        start_epoch = latest_epoch + 1
+        print(f"Resuming from epoch {latest_epoch}")
+    else:
+        start_epoch = 1
 
     loss_history = []
 
-    for epoch in range(start_epoch, EPOCHS+1):
+    # 7. 训练循环
+    for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
         total_loss = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}", unit="batch")
-        for spatial, gage, runoff in pbar:
-            # spatial, gage, runoff 已经都在 GPU 上，无需 .to(device) 拷贝
-            pred = model(spatial, gage)
+        for spatial, gage, prev_runoff, runoff in pbar:
+            # data 已经在 GPU 上
+            # forward
+            pred = model(spatial, gage, prev_runoff)
             loss = criterion(pred, runoff)
 
+            # backward
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -309,41 +357,35 @@ def main():
             total_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        avg = total_loss / len(loader)
-        print(f"Epoch {epoch}: Avg Loss={avg:.4f}")
-        scheduler.step(avg)
-        loss_history.append(avg)
-        # …（保存 checkpoint、画图等逻辑保持不变）…
+        avg_loss = total_loss / len(loader)
+        print(f"Epoch {epoch}: Avg Loss={avg_loss:.4f}")
 
+        # 调度
+        scheduler.step(avg_loss)
+        loss_history.append(avg_loss)
+
+        # 保存 checkpoint & 画图
         if epoch == EPOCHS:
-            save_path = "lstm{inputw}min_epoch{nepoch}_1e_{thelr}.pth".format(
-                nepoch = EPOCHS,
-                inputw = T_STEPS,
-                thelr = abs(LR_POWER)
-            )
-            save_path = checkpoint_dir + save_path
+            save_name = f"Newlstm{T_STEPS}h_epoch{EPOCHS}_1e_{abs(LR_POWER)}.pth"
+            save_path = os.path.join(checkpoint_dir, save_name)
             torch.save({
-                'epoch': EPOCHS,
+                'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg
+                'loss': avg_loss
             }, save_path)
+
             plt.figure(figsize=(8, 4))
             plt.plot(loss_history, marker='o')
             plt.title("Training Loss Over Epochs")
             plt.xlabel("Epoch")
             plt.ylabel("Loss")
             plt.grid(True)
-            pic_name = "loss{inputw}min_1e_{thelr}_curve.png".format(
-                inputw = T_STEPS,
-                thelr = abs(LR_POWER)
-                )
-            pic_name = picPath + pic_name
-            plt.savefig(pic_name)
-            print("Loss curve saved.")            
-
-
+            pic_name = f"Newloss{T_STEPS}h_1e_{abs(LR_POWER)}_curve.png"
+            plt.savefig(os.path.join(picPath, pic_name))
+            print("Loss curve saved.")
+ 
 
 if __name__ == "__main__":
-    # main()
-    verify_non_overlapping_windows_to_csv()
+    main()
+    # verify_non_overlapping_windows_to_csv()

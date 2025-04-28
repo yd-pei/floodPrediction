@@ -13,8 +13,12 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor
+import sys
+
 
 # ===================== 超参数 =====================
+
+disable_tqdm = os.getenv("DISABLE_TQDM", "0") == "1"
 data_dir    = "./data/"
 model_dir   = "./checkpoint/"
 picPath     = "./lossPic/"
@@ -24,13 +28,12 @@ PRECIP_PT   = os.path.join(data_dir, "precip.pt")
 DEM_PATH    = os.path.join(data_dir, "dem_resampled.tif")
 GAGE_CSV    = os.path.join(data_dir, "gageheight_ffill.csv")
 RUNOFF_CSV  = os.path.join(data_dir, "runoff_hourly.csv")
-VALID_CKP   = os.path.join(checkpoint_dir, "lstm36min_epoch200_1e_3.pth")
 
-T_STEPS     = 36      # 滑窗长度
+T_STEPS     = 12      # 滑窗长度
 BATCH_SIZE  = 32
-LR_POWER = -3
-LR          = 1*(10 ** LR_POWER)
-EPOCHS      = 200
+LR_POWER = - 3
+LR          = 10 ** LR_POWER
+EPOCHS      = 100
 STATION_ID  = 2301738
 
 READING_THREAD = 0
@@ -179,75 +182,72 @@ class FloodPredictor(nn.Module):
         h_pool  = self.pool(h).flatten(1)
         x       = torch.cat([h_pool, gage_scalar.view(-1, 1)], dim=1)
         return self.fc(x).squeeze(1)
-
-def verify_non_overlapping_windows_to_csv():
-    """
-    非重叠 36 小时窗口验证，并把结果输出到 CSV。
-    """
-    # 1. 设备 & 预加载
+# test
+def verify():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    precip_all, dem = direct_preload(device)
+    start = datetime(2020, 1, 1, 0)
+    end   = datetime(2021, 1, 1, 0)
+    total_hours  = int((end - start).total_seconds() // 3600)
+    start_times  = [start + timedelta(hours=i) for i in range(total_hours - T_STEPS + 1)]
 
-    # 2. 加载模型
-    model = FloodPredictor().to(device)
-    ckpt = torch.load(VALID_CKP, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    dataset     = FloodDataset(start_times, T_STEPS, PRECIP_DIR, DEM_PATH, GAGE_CSV, RUNOFF_CSV, STATION_ID)
+    dataloader  = DataLoader(dataset,
+                             batch_size=BATCH_SIZE,
+                             shuffle=True,
+                             num_workers=READING_THREAD,
+                             pin_memory=(device.type == "cuda"),
+                             persistent_workers=True)
+    model       = FloodPredictor().to(device)
+    checkpoints = []
+    pattern = re.compile(r"FloodPredictor_epoch(\d+)\.pth")
+    for fname in os.listdir(checkpoint_dir):
+        match = pattern.match(fname)
+        if match:
+            epoch = int(match.group(1))
+            checkpoints.append((epoch, fname))
+
+    if checkpoints:
+        latest_epoch, latest_file = max(checkpoints, key=lambda x: x[0])
+        checkpoint_path = os.path.join(checkpoint_dir, latest_file)
+        print(f"加载最新模型：{latest_file}（epoch {latest_epoch}）")
+        checkpoint = torch.load(checkpoint_path,map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.to(device)
+    else:
+        print("No checkpoint.")
+        return
+    
     model.eval()
+    
+    # —— 2. 测试代码（禁用梯度计算） ——
+    preds_list = []
+    labels_list = []
 
-    # 3. 定义验证窗口
-    val_start = datetime(2020, 1, 1, 0, 0)
-    val_end   = datetime(2021, 1, 1, 0, 0)
-    window_delta = timedelta(hours=T_STEPS)
-    total_windows = (val_end - val_start) // window_delta
+    with torch.no_grad():
+        for spatial_batch, gage_batch, runoff_batch in dataloader:
+            spatial_batch = spatial_batch.to(device)
+            gage_batch    = gage_batch.to(device)
+            runoff_batch  = runoff_batch.to(device)
 
-    # 4. 循环验证，收集结果
-    records = []
-    for i in range(total_windows):
-        start_time = val_start + i * window_delta
-        end_time   = start_time + window_delta
+            preds = model(spatial_batch, gage_batch)
 
-        ds = FloodDataset(
-            start_times=[start_time],
-            precip_all=precip_all,
-            dem=dem,
-            gage_csv=GAGE_CSV,
-            runoff_csv=RUNOFF_CSV,
-            station_id=STATION_ID,
-            base_time=val_start,
-            t_steps=T_STEPS
-        )
-        loader = DataLoader(ds, batch_size=1, shuffle=False)
+            preds_list.append(preds.cpu())
+            labels_list.append(runoff_batch.cpu())
 
-        with torch.no_grad():
-            for spatial, gage, true_runoff in loader:
-                spatial     = spatial.to(device)
-                gage        = gage.to(device)
-                true_runoff = true_runoff.to(device)
+    # —— 3. 整合输出 ——
+    preds_all  = torch.cat(preds_list).numpy()
+    labels_all = torch.cat(labels_list).numpy()
 
-                pred = model(spatial, gage)
-
-                pred_val = pred.item()
-                true_val = true_runoff.item()
-                err = pred - true_runoff
-                mse = float((err ** 2).item())
-                mae = float(err.abs().item())
-
-        records.append({
-            "window_idx":     i + 1,
-            "start_time":     start_time.isoformat(),
-            "end_time":       end_time.isoformat(),
-            "predicted":      pred_val,
-            "ground_truth":   true_val,
-            "mse":            mse,
-            "mae":            mae
-        })
-        print(f"[窗口 {i+1}] {start_time} → {end_time}  MSE={mse:.4f}  MAE={mae:.4f}")
-
-    # 5. 保存到 CSV
-    df = pd.DataFrame(records)
-    csv_path = os.path.join(checkpoint_dir, "predictions_non_overlap.csv")
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    print(f"\n已将所有窗口的预测结果保存到: {csv_path}")
+    # —— 4. 可视化结果 ——
+    plt.figure(figsize=(10, 5))
+    plt.plot(labels_all, label="True Runoff")
+    plt.plot(preds_all,  label="Predicted Runoff")
+    plt.xlabel("Sample Index")
+    plt.ylabel("Runoff")
+    plt.title("Model Predictions vs Ground Truth")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
 # ================ 主流程 ================================
 def main():
@@ -296,8 +296,8 @@ def main():
     for epoch in range(start_epoch, EPOCHS+1):
         model.train()
         total_loss = 0.0
-        pbar = tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}", unit="batch")
-        for spatial, gage, runoff in pbar:
+        # pbar = tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}", unit="batch", disable=disable_tqdm, file=sys.stderr)
+        for spatial, gage, runoff in loader:
             # spatial, gage, runoff 已经都在 GPU 上，无需 .to(device) 拷贝
             pred = model(spatial, gage)
             loss = criterion(pred, runoff)
@@ -307,10 +307,10 @@ def main():
             optimizer.step()
 
             total_loss += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            # pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         avg = total_loss / len(loader)
-        print(f"Epoch {epoch}: Avg Loss={avg:.4f}")
+        print(f"Epoch {epoch}: Avg Loss={avg:.4f}",flush = True)
         scheduler.step(avg)
         loss_history.append(avg)
         # …（保存 checkpoint、画图等逻辑保持不变）…
@@ -345,5 +345,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # main()
-    verify_non_overlapping_windows_to_csv()
+    main()
