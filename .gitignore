@@ -6,4 +6,11 @@
 /oldLossPic
 /tool
 /newdata
+/old_file
+/cloudcode
+/cloudcode2
+/dist
+/build
+/flood_model.egg-info
+/flood_model/__pycache__
 /data/precip.pt
