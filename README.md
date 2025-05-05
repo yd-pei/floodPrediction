@@ -9,14 +9,14 @@ If you want to train the model, please download dataset file ```https://pics1.ob
 
 If you just want to test the model, you can run the code below directly.
 ```bash
-pip install -r requirements.txt
-pip install -e .
+$ pip install -r requirements.txt
+$ pip install -e .
 ```
 
 ## Usage
 
-- **Training**: `flood-train --epochs 10 --batch-size 32 --lr 1e-4`
-- **Validation**: `flood-validate`
+- **Training**: `$ flood-train --epochs 10 --batch-size 32 --lr 1e-4`
+- **Validation**: `$ flood-validate`
 
 ## Project Structure
 
